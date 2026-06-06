@@ -1,0 +1,10 @@
+fastapi
+uvicorn
+pymongo
+openai
+google-generativeai
+python-multipart
+pydantic
+sse-starlette
+python-dotenv
+pypdf

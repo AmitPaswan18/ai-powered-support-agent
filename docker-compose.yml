@@ -1,0 +1,33 @@
+version: '3.8'
+
+services:
+  fastapi-service:
+    build:
+      context: ./apps/fastapi-service
+    ports:
+      - "8000:8000"
+    environment:
+      - MONGODB_URI=${MONGODB_URI}
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+
+  express-gateway:
+    build:
+      context: ./apps/express-gateway
+    ports:
+      - "5000:5000"
+    environment:
+      - MONGODB_URI=${MONGODB_URI}
+      - FASTAPI_SERVICE_URL=http://fastapi-service:8000
+      - PORT=5000
+    depends_on:
+      - fastapi-service
+
+  web:
+    build:
+      context: ./apps/web
+      args:
+        - VITE_API_URL=http://localhost:5000
+    ports:
+      - "3000:80"
+    depends_on:
+      - express-gateway
