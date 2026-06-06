@@ -253,37 +253,81 @@ async def chat_stream(request: QueryRequest):
         
         try:
             cursor = collection.aggregate(pipeline)
+            retrieved_chunks = []
             for doc in cursor:
-                context_list.append(f"Source Document: {doc['title']}\nContent: {doc['text']}")
-                if doc["title"] not in sources:
-                    sources.append(doc["title"])
-        except Exception as e:
-            logger.warning(f"Vector search failed or index is not set up yet. Falling back to regex search: {e}")
+                retrieved_chunks.append({
+                    "title": doc["title"],
+                    "text": doc["text"],
+                    "score": doc.get("score", 0.0)
+                })
             
-            # Robust case-insensitive fallback keyword-based regex matching
+            if retrieved_chunks:
+                # --- Per-document score aggregation ---
+                # Group chunks by document title and sum their scores.
+                # This prevents a low-relevance doc from sneaking in because
+                # one of its chunks happened to be within a flat ±0.05 window.
+                doc_score_map: dict = {}
+                doc_chunks_map: dict = {}
+                for c in retrieved_chunks:
+                    title = c["title"]
+                    doc_score_map[title] = doc_score_map.get(title, 0.0) + c["score"]
+                    doc_chunks_map.setdefault(title, []).append(c)
+
+                # Find the document with the highest cumulative score
+                best_doc_title = max(doc_score_map, key=lambda t: doc_score_map[t])
+                best_doc_total = doc_score_map[best_doc_title]
+
+                # Only allow other documents if their total score is within 10% of the best
+                relevance_threshold = best_doc_total * 0.90
+                selected_titles = [
+                    t for t, s in doc_score_map.items() if s >= relevance_threshold
+                ]
+
+                for title in selected_titles:
+                    for c in doc_chunks_map[title]:
+                        context_list.append(f"Source Document: {c['title']}\nContent: {c['text']}")
+                    if title not in sources:
+                        sources.append(title)
+        except Exception as e:
+            logger.warning(f"Vector search failed or index is not set up yet. Falling back to scored keyword search: {e}")
+            
             try:
-                keywords = [w for w in re.split(r'\W+', request.query) if len(w) > 3]
-                if keywords:
-                    regex_pattern = "|".join(keywords)
-                    cursor = collection.find({"text": {"$regex": regex_pattern, "$options": "i"}}).limit(6)
-                else:
-                    cursor = collection.find({"text": {"$regex": request.query, "$options": "i"}}).limit(6)
-                    
-                for doc in cursor:
-                    context_list.append(f"Source Document: {doc['title']}\nContent: {doc['text']}")
-                    if doc["title"] not in sources:
-                        sources.append(doc["title"])
+                # Score each chunk by how many unique query keywords appear in its text
+                keywords = [w.lower() for w in re.split(r'\W+', request.query) if len(w) > 3]
+                if not keywords:
+                    keywords = [w.lower() for w in re.split(r'\W+', request.query) if len(w) > 1]
+
+                # Fetch a broader candidate set to rank from
+                regex_pattern = "|".join(re.escape(k) for k in keywords) if keywords else request.query
+                candidate_cursor = collection.find(
+                    {"text": {"$regex": regex_pattern, "$options": "i"}}
+                ).limit(20)
+
+                scored_chunks = []
+                for doc in candidate_cursor:
+                    text_lower = doc["text"].lower()
+                    # Count how many distinct keywords appear in this chunk's text
+                    hit_count = sum(1 for kw in keywords if kw in text_lower)
+                    scored_chunks.append({
+                        "title": doc["title"],
+                        "text": doc["text"],
+                        "hits": hit_count
+                    })
+
+                if scored_chunks:
+                    max_hits = max(c["hits"] for c in scored_chunks)
+                    # Keep only chunks within 20% of the top keyword hit count
+                    hit_threshold = max(1, max_hits - max(1, round(max_hits * 0.20)))
+                    top_chunks = [c for c in scored_chunks if c["hits"] >= hit_threshold]
+                    # Sort by hits descending and cap at 3 chunks to stay focused
+                    top_chunks.sort(key=lambda c: c["hits"], reverse=True)
+                    for c in top_chunks[:3]:
+                        context_list.append(f"Source Document: {c['title']}\nContent: {c['text']}")
+                        if c["title"] not in sources:
+                            sources.append(c["title"])
+
             except Exception as err_regex:
-                logger.error(f"Regex fallback query failed: {err_regex}")
-                # Final fallback: simple find limit 6
-                try:
-                    cursor = collection.find().limit(6)
-                    for doc in cursor:
-                        context_list.append(f"Source Document: {doc['title']}\nContent: {doc['text']}")
-                        if doc["title"] not in sources:
-                            sources.append(doc["title"])
-                except Exception:
-                    pass
+                logger.error(f"Scored keyword fallback failed: {err_regex}")
 
     context_text = "\n\n".join(context_list) if context_list else "No relevant documentation found."
     

@@ -244,6 +244,7 @@ function App() {
   const [messages, setMessages] = useState([]);
   const [input, setInput] = useState('');
   const [isLoading, setIsLoading] = useState(false);
+  const [isSessionLoading, setIsSessionLoading] = useState(false);
   const [isUploading, setIsUploading] = useState(false);
   const [uploadedDocs, setUploadedDocs] = useState([]);
 
@@ -283,6 +284,10 @@ function App() {
   // Request Abort Ref
   const abortControllerRef = useRef(null);
   const isInternalSessionChangeRef = useRef(false);
+
+  // Client-side session message cache — avoids re-fetching already loaded sessions
+  // Map<sessionId, messages[]> — lives for the lifetime of the page
+  const sessionCacheRef = useRef(new Map());
 
   // Ingest form state
   const [uploadFile, setUploadFile] = useState(null);
@@ -365,14 +370,27 @@ function App() {
   };
 
   const fetchSessionDetails = async (id) => {
+    // ── Cache hit: render instantly, skip loader and API call ──
+    if (sessionCacheRef.current.has(id)) {
+      setMessages(sessionCacheRef.current.get(id));
+      return;
+    }
+
+    setIsSessionLoading(true);
+    setMessages([]); // clear stale messages immediately
     try {
       const res = await fetch(`${API_URL}/api/sessions/${id}`);
       if (res.ok) {
         const data = await res.json();
-        setMessages(data.messages || []);
+        const msgs = data.messages || [];
+        setMessages(msgs);
+        // Populate cache for next visit
+        sessionCacheRef.current.set(id, msgs);
       }
     } catch (err) {
       console.error("Error fetching session details:", err);
+    } finally {
+      setIsSessionLoading(false);
     }
   };
 
@@ -389,6 +407,8 @@ function App() {
       if (res.ok) {
         const updated = sessions.filter(s => s._id !== id);
         setSessions(updated);
+        // Evict deleted session from cache
+        sessionCacheRef.current.delete(id);
         if (currentSessionId === id) {
           setCurrentSessionId(updated.length > 0 ? updated[0]._id : null);
         }
@@ -756,7 +776,7 @@ function App() {
         }
       }
 
-      // Complete
+      // Complete — strip streaming flag and finalize sources
       setMessages(prev => {
         const next = [...prev];
         const lastIdx = next.length - 1;
@@ -774,6 +794,10 @@ function App() {
           const isFallback = content.includes("I cannot find the answer");
           next[lastIdx].content = content;
           next[lastIdx].sources = isFallback ? [] : displaySources;
+        }
+        // ── Write finalized messages into the cache ──
+        if (activeSessionId) {
+          sessionCacheRef.current.set(activeSessionId, next);
         }
         return next;
       });
@@ -1060,7 +1084,57 @@ function App() {
 
         {/* Chat History / Stream Area */}
         <div className="flex-1 overflow-y-auto p-6 space-y-6">
-          {messages.length === 0 ? (
+          {isSessionLoading ? (
+            /* ── History Session Skeleton Loader ── */
+            <div className="max-w-3xl mx-auto space-y-6 animate-pulse">
+              <div className="flex items-center justify-center gap-2 text-xs text-slate-400 dark:text-slate-500 mb-2">
+                <Loader2 className="h-3.5 w-3.5 animate-spin text-indigo-500" />
+                <span>Loading conversation…</span>
+              </div>
+
+              {/* Skeleton message — user */}
+              <div className="flex justify-end">
+                <div className="flex flex-col items-end gap-1.5 max-w-[70%]">
+                  <div className="h-10 bg-indigo-100 dark:bg-indigo-900/30 rounded-2xl rounded-br-sm w-56" />
+                  <div className="h-3 bg-slate-100 dark:bg-slate-800 rounded w-20" />
+                </div>
+              </div>
+
+              {/* Skeleton message — assistant (multi-line) */}
+              <div className="flex justify-start">
+                <div className="flex gap-3 max-w-[75%]">
+                  <div className="h-8 w-8 rounded-full bg-indigo-100 dark:bg-indigo-900/30 shrink-0 mt-1" />
+                  <div className="flex flex-col gap-2 flex-1">
+                    <div className="h-4 bg-slate-100 dark:bg-slate-800 rounded w-full" />
+                    <div className="h-4 bg-slate-100 dark:bg-slate-800 rounded w-5/6" />
+                    <div className="h-4 bg-slate-100 dark:bg-slate-800 rounded w-4/6" />
+                    <div className="h-3 bg-slate-100 dark:bg-slate-800 rounded w-24 mt-1" />
+                  </div>
+                </div>
+              </div>
+
+              {/* Skeleton message — user */}
+              <div className="flex justify-end">
+                <div className="flex flex-col items-end gap-1.5 max-w-[70%]">
+                  <div className="h-10 bg-indigo-100 dark:bg-indigo-900/30 rounded-2xl rounded-br-sm w-40" />
+                  <div className="h-3 bg-slate-100 dark:bg-slate-800 rounded w-20" />
+                </div>
+              </div>
+
+              {/* Skeleton message — assistant (short) */}
+              <div className="flex justify-start">
+                <div className="flex gap-3 max-w-[75%]">
+                  <div className="h-8 w-8 rounded-full bg-indigo-100 dark:bg-indigo-900/30 shrink-0 mt-1" />
+                  <div className="flex flex-col gap-2 flex-1">
+                    <div className="h-4 bg-slate-100 dark:bg-slate-800 rounded w-full" />
+                    <div className="h-4 bg-slate-100 dark:bg-slate-800 rounded w-3/4" />
+                    <div className="h-3 bg-slate-100 dark:bg-slate-800 rounded w-24 mt-1" />
+                  </div>
+                </div>
+              </div>
+            </div>
+          ) : messages.length === 0 ? (
+
             <div className="max-w-3xl mx-auto mt-6 space-y-8 fade-enter fade-enter-active">
 
               {/* Dashboard Hero */}
@@ -1178,7 +1252,7 @@ function App() {
                     </div>
 
                     {/* Sources / Citations */}
-                    {m.role === 'assistant' && m.sources && m.sources.length > 0 && (
+                    {m.role === 'assistant' && !m.streaming && m.sources && m.sources.length > 0 && (
                       <div className="mt-4 pt-3 border-t border-slate-100 dark:border-slate-800">
                         <div className="flex items-center gap-1.5 text-xs text-slate-500 dark:text-slate-400 mb-2 font-medium">
                           <FileText className="h-3.5 w-3.5 text-indigo-600 dark:text-indigo-400" />

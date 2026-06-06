@@ -25,14 +25,30 @@ const SessionSchema = new mongoose.Schema({
 
 const Session = mongoose.models.Session || mongoose.model('Session', SessionSchema);
 
-// MongoDB connection
+// Lazy MongoDB connection — safe for Vercel serverless cold starts
+// Mongoose buffers queries until connected, but on serverless the 10s buffer
+// expires before the async connect() resolves. We fix this by explicitly
+// awaiting the connection inside every route that touches MongoDB.
 const mongoUri = process.env.MONGODB_URI;
-if (mongoUri) {
-  mongoose.connect(mongoUri)
-    .then(() => console.log('Connected to MongoDB Atlas'))
-    .catch((err) => console.error('MongoDB connection error:', err));
-} else {
-  console.warn('MONGODB_URI is not set. Chat session saving will not work.');
+let mongoConnected = false;
+
+async function connectDB() {
+  if (mongoConnected || mongoose.connection.readyState === 1) return;
+  if (!mongoUri) {
+    console.warn('MONGODB_URI is not set. MongoDB features will not work.');
+    return;
+  }
+  try {
+    await mongoose.connect(mongoUri, {
+      serverSelectionTimeoutMS: 8000, // fail fast — Vercel functions timeout at 10s
+      socketTimeoutMS: 8000,
+    });
+    mongoConnected = true;
+    console.log('Connected to MongoDB Atlas');
+  } catch (err) {
+    console.error('MongoDB connection error:', err);
+    throw err;
+  }
 }
 
 const FASTAPI_SERVICE_URL = process.env.FASTAPI_SERVICE_URL || 'http://localhost:8000';
@@ -58,6 +74,7 @@ app.get('/api/health', async (req, res) => {
 // Get all chat sessions
 app.get('/api/sessions', async (req, res) => {
   try {
+    await connectDB();
     const sessions = await Session.find().sort({ updatedAt: -1 });
     res.json(sessions);
   } catch (error) {
@@ -68,6 +85,7 @@ app.get('/api/sessions', async (req, res) => {
 // Get a single session
 app.get('/api/sessions/:id', async (req, res) => {
   try {
+    await connectDB();
     const session = await Session.findById(req.params.id);
     if (!session) return res.status(404).json({ error: 'Session not found' });
     res.json(session);
@@ -79,6 +97,7 @@ app.get('/api/sessions/:id', async (req, res) => {
 // Delete a session
 app.delete('/api/sessions/:id', async (req, res) => {
   try {
+    await connectDB();
     const session = await Session.findByIdAndDelete(req.params.id);
     if (!session) return res.status(404).json({ error: 'Session not found' });
     res.json({ success: true, message: 'Session deleted' });
@@ -92,6 +111,7 @@ app.put('/api/sessions/:id', async (req, res) => {
   const { title } = req.body;
   if (!title) return res.status(400).json({ error: 'Title is required' });
   try {
+    await connectDB();
     const session = await Session.findByIdAndUpdate(req.params.id, { title }, { new: true });
     if (!session) return res.status(404).json({ error: 'Session not found' });
     res.json(session);
@@ -103,6 +123,7 @@ app.put('/api/sessions/:id', async (req, res) => {
 // Delete all sessions
 app.delete('/api/sessions', async (req, res) => {
   try {
+    await connectDB();
     await Session.deleteMany({});
     res.json({ success: true, message: 'All sessions deleted' });
   } catch (error) {
@@ -217,6 +238,9 @@ app.post('/api/chat/stream', rateLimiter, async (req, res) => {
   try {
     let session;
     let history = [];
+
+    // Ensure DB is connected before any query
+    await connectDB();
 
     // Find or create session
     if (sessionId) {
